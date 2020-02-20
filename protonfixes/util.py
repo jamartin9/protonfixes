@@ -7,14 +7,16 @@ import sys
 import re
 import shutil
 import signal
+import zipfile
 import subprocess
+import urllib.request
 import functools
 from .logger import log
+from . import config
 from .protonmain_compat import protonmain
-from .protonversion import PROTON_VERSION, PROTON_TIMESTAMP
-from .progress import TrackProgress
 
 # pylint: disable=unreachable
+
 
 def which(appname):
     """ Returns the full path of an executable in $PATH
@@ -46,15 +48,30 @@ def protonprefix():
 
 
 def protonnameversion():
-    """ Returns the version of proton
+    """ Returns the version of proton from sys.argv[0]
     """
-    return '{major}.{minor}'.format(**PROTON_VERSION)
+
+    version = re.search('Proton ([0-9]*\\.[0-9]*)', sys.argv[0])
+    if version:
+        return version.group(1)
+    log.warn('Proton version not parsed from command line')
+    return None
 
 
 def protontimeversion():
     """ Returns the version timestamp of proton from the `version` file
     """
-    return PROTON_TIMESTAMP
+
+    fullpath = os.path.join(protondir(), 'version')
+    try:
+        with open(fullpath, 'r') as version:
+            for timestamp in version.readlines():
+                return int(timestamp.strip())
+    except OSError:
+        log.warn('Proton version file not found in: ' + fullpath)
+        return 0
+    log.warn('Proton version not parsed from file: ' + fullpath)
+    return 0
 
 
 def protonversion(timestamp=False):
@@ -64,6 +81,7 @@ def protonversion(timestamp=False):
     if timestamp:
         return protontimeversion()
     return protonnameversion()
+
 
 def once(func=None, retry=None):
     """ Decorator to use on functions which should only run once in a prefix.
@@ -97,7 +115,7 @@ def once(func=None, retry=None):
         exception = None
         try:
             func(*args, **kwargs)
-        except Exception as exc: #pylint: disable=broad-except
+        except Exception as exc:  #pylint: disable=broad-except
             if retry:
                 raise exc
             exception = exc
@@ -105,10 +123,11 @@ def once(func=None, retry=None):
         open(file, 'a').close()
 
         if exception:
-            raise exception #pylint: disable=raising-bad-type
+            raise exception  #pylint: disable=raising-bad-type
 
         return
     return wrapper
+
 
 def _killhanging():
     """ Kills processes that hang when installing winetricks
@@ -128,6 +147,7 @@ def _killhanging():
         except IOError:
             continue
 
+
 def _del_syswow64():
     """ Deletes the syswow64 folder
     """
@@ -136,6 +156,7 @@ def _del_syswow64():
         shutil.rmtree(os.path.join(protonprefix(), 'drive_c/windows/syswow64'))
     except FileNotFoundError:
         log.warn('The syswow64 folder was not found')
+
 
 def _mk_syswow64():
     """ Makes the syswow64 folder
@@ -220,14 +241,17 @@ def is_custom_verb(verb):
     return False
 
 
-@TrackProgress("Installing winetrick: {}")
 def protontricks(verb):
     """ Runs winetricks if available
     """
 
     if not checkinstalled(verb):
         log.info('Installing winetricks ' + verb)
-        env = mk_wine_env()
+        env = dict(protonmain.g_session.env)
+        env['WINEPREFIX'] = protonprefix()
+        env['WINE'] = protonmain.g_proton.wine_bin
+        env['WINELOADER'] = protonmain.g_proton.wine_bin
+        env['WINESERVER'] = protonmain.g_proton.wineserver_bin
         env['WINETRICKS_LATEST_VERSION_CHECK'] = 'disabled'
         env['LD_PRELOAD'] = ''
 
@@ -251,8 +275,16 @@ def protontricks(verb):
                 log.info('Deleting syswow64')
                 _del_syswow64()
 
+            # make sure proton waits for winetricks to finish
+            for idx, arg in enumerate(sys.argv):
+                if 'waitforexitandrun' not in arg:
+                    sys.argv[idx] = arg.replace('run', 'waitforexitandrun')
+                    log.debug(str(sys.argv))
+
             log.info('Using winetricks verb ' + verb)
-            _run_cmd(winetricks_cmd, env, None)
+            subprocess.call([env['WINESERVER'], '-w'], env=env)
+            process = subprocess.Popen(winetricks_cmd, env=env)
+            process.wait()
             _killhanging()
 
             # Check if verb recorded to winetricks log
@@ -268,40 +300,6 @@ def protontricks(verb):
                 log.info('Restoring syswow64 folder')
                 _mk_syswow64()
     return False
-
-
-def wine_run(command, cwd=None):
-    """ Run a wine command
-    """
-    env = mk_wine_env()
-    wine_cmd = protonmain.g_proton.wine_bin
-    final_cmd = [wine_cmd, ] + command
-    _run_cmd(final_cmd, env, cwd)
-
-
-def mk_wine_env():
-    """ Makes a sane environment dictionary to run wine-related commands
-    """
-    env = dict(protonmain.g_session.env)
-    env['WINEPREFIX'] = protonprefix()
-    env['WINE'] = protonmain.g_proton.wine_bin
-    env['WINELOADER'] = protonmain.g_proton.wine_bin
-    env['WINESERVER'] = protonmain.g_proton.wineserver_bin
-    return env
-
-
-def _run_cmd(command, env, cwd=None):
-    chdir = cwd or get_game_install_path()
-    # make sure proton waits for the command to finish
-    for idx, arg in enumerate(sys.argv):
-        if arg.endswith('proton'):
-            sys.argv[idx + 1] = 'waitforexitandrun'
-            log.debug(str(sys.argv))
-            break
-    log.info("Running: " + ' '.join(command))
-    subprocess.call([env['WINESERVER'], '-w'], env=env)
-    process = subprocess.Popen(command, env=env, cwd=chdir)
-    process.wait()
 
 
 def win32_prefix_exists():
@@ -380,6 +378,7 @@ def replace_command(orig_str, repl_str):
         if orig_str in arg:
             sys.argv[idx] = arg.replace(orig_str, repl_str)
 
+
 def append_argument(argument):
     """ Append an argument to sys.argv
     """
@@ -388,6 +387,7 @@ def append_argument(argument):
     sys.argv.append(argument)
     log.debug('New commandline: ' + str(sys.argv))
 
+
 def set_environment(envvar, value):
     """ Add or override an environment value
     """
@@ -395,6 +395,7 @@ def set_environment(envvar, value):
     log.info('Adding env: ' + envvar + '=' + value)
     os.environ[envvar] = value
     protonmain.g_session.env[envvar] = value
+
 
 def del_environment(envvar):
     """ Remove an environment variable
@@ -406,6 +407,7 @@ def del_environment(envvar):
     if envvar in protonmain.g_session.env:
         del protonmain.g_session.env[envvar]
 
+
 def get_game_install_path():
     """ Game installation path
     """
@@ -413,6 +415,7 @@ def get_game_install_path():
     log.debug('Detected path to game: ' + os.environ['PWD'])
     # only for `waitforexitandrun` command
     return os.environ['PWD']
+
 
 def get_game_exe_name():
     """ Game executable name
@@ -428,6 +431,7 @@ def get_game_exe_name():
     log.debug('Detected executable: ' + game_name)
     return game_name
 
+
 def winedll_override(dll, dtype):
     """ Add WINE dll override
     """
@@ -435,11 +439,13 @@ def winedll_override(dll, dtype):
     log.info('Overriding ' + dll + '.dll = ' + dtype)
     protonmain.g_session.dlloverrides[dll] = dtype
 
+
 def winecfg():
     """ Run winecfg.exe
     """
     game_path = os.path.join(get_game_install_path(), get_game_exe_name())
     replace_command(game_path, 'winecfg.exe')
+
 
 def regedit():
     """ Run regedit.exe
@@ -447,11 +453,13 @@ def regedit():
     game_path = os.path.join(get_game_install_path(), get_game_exe_name())
     replace_command(game_path, 'regedit.exe')
 
+
 def control():
     """ Run control.exe
     """
     game_path = os.path.join(get_game_install_path(), get_game_exe_name())
     replace_command(game_path, 'control.exe')
+
 
 def disable_nvapi():
     """ Disable WINE nv* dlls
@@ -461,33 +469,36 @@ def disable_nvapi():
     winedll_override('nvapi', '')
     winedll_override('nvapi64', '')
     winedll_override('nvcuda', '')
+
     winedll_override('nvcuvid', '')
     winedll_override('nvencodeapi', '')
     winedll_override('nvencodeapi64', '')
 
-def disable_d3d10():
-    """ Disable WINE d3d10* dlls
-    """
-
-    log.info('Disabling d3d10')
-    winedll_override('d3d10', '')
-    winedll_override('d3d10_1', '')
-    winedll_override('d3d10core', '')
-
-def enable_d9vk():  # pylint: disable=missing-docstring
-    set_environment('PROTON_USE_D9VK', '1')
 
 def disable_dxvk():  # pylint: disable=missing-docstring
-    set_environment('PROTON_USE_WINED3D11', '1')
+    set_environment('PROTON_USE_WINED3D', '1')
+    set_environment('PROTON_USE_WINED3D11', '1')  # proton <= 3.7
+
+
+def disable_d3d11():  # pylint: disable=missing-docstring
+    set_environment('PROTON_NO_D3D11', '1')
+
+
+def disable_d3d10():  # pylint: disable=missing-docstring
+    set_environment('PROTON_NO_D3D10', '1')
+
 
 def disable_esync():  # pylint: disable=missing-docstring
     set_environment('PROTON_NO_ESYNC', '1')
 
-def disable_fsync(): # pylint: disable=missing-docstring
+
+def disable_fsync():  # pylint: disable=missing-docstring
     set_environment('PROTON_NO_FSYNC', '1')
 
-def disable_d3d11():  # pylint: disable=missing-docstring
-    set_environment('PROTON_NO_D3D11', '1')
+
+def enable_d9vk():  # pylint: disable=missing-docstring
+    set_environment('PROTON_USE_D9VK', '1')  # proton < 5.0
+
 
 @once
 def disable_uplay_overlay():
@@ -519,6 +530,7 @@ def disable_uplay_overlay():
         return
     except OSError as err:
         log.warn('Could not disable UPlay overlay: ' + err.strerror)
+
 
 def create_dosbox_conf(conf_file, conf_dict):
     """Create DOSBox configuration file.
@@ -629,3 +641,24 @@ def set_dxvk_option(opt, val, cfile='/tmp/protonfixes_dxvk.conf'):
         dxvkopts = fini.read().splitlines(True)
     with open(cfile, 'w') as fdxvk:
         fdxvk.writelines(dxvkopts[1:])
+
+
+def install_from_zip(url, filename, path=os.getcwd()):
+    """ Install a file from a downloaded zip
+    """
+
+    if filename in os.listdir(path):
+        log.info('File ' + filename + ' found in ' + path)
+        return
+
+    cache_dir = config.cache_dir
+    zip_file_name = os.path.basename(url)
+    zip_file_path = os.path.join(cache_dir, zip_file_name)
+
+    if zip_file_name not in os.listdir(cache_dir):
+        log.info('Downloading ' + filename + ' to ' + zip_file_path)
+        urllib.request.urlretrieve(url, zip_file_path)
+
+    with zipfile.ZipFile(zip_file_path, 'r') as zip_obj:
+        log.info('Extracting ' + filename + ' to ' + path)
+        zip_obj.extract(filename, path=path)
