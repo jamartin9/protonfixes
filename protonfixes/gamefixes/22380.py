@@ -6,10 +6,13 @@ from protonfixes.protonversion import DeprecatedSince
 
 @DeprecatedSince("5.0-3")
 def main():
-    """ Disable AA and Water Reflections/Refractions
+    """ Use D3D9, quartz for audio, disable AA & water reflections/refractions
     """
     # DX9 game
     util.disable_dxvk()
+
+    # quartz for audio
+    util.protontricks('quartz')
 
     # Graphics and HUD glitches when
     # AntiAliasing and Water Reflections/Refractions are enabled
